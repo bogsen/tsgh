@@ -1,8 +1,7 @@
 # tsgh
 
-`tsgh` is a tailnet-only GitHub token broker. It uses Tailscale identity and the
-fixed `bog.dev/cap/tsgh` app capability to mint short-lived GitHub App tokens
-whose repositories and permissions come from grants.
+`tsgh` is a tailnet-only GitHub token broker. It uses Tailscale identity to mint
+short-lived GitHub App tokens whose repositories and permissions come from grants.
 
 ## Tailscale grants
 
@@ -15,6 +14,7 @@ capability array:
     {
       "src": ["group:developers"],
       "dst": ["tag:tsgh"],
+      "ip": ["*"],
       "app": {
         "bog.dev/cap/tsgh": [
           {"target": "acme", "repositories": ["api", "web"]},
@@ -25,6 +25,7 @@ capability array:
     {
       "src": ["alice@example.com"],
       "dst": ["tag:tsgh"],
+      "ip": ["*"],
       "app": {
         "bog.dev/cap/tsgh": [
           {"target": "acme", "githubUser": "octocat"}
@@ -94,7 +95,34 @@ the link with `GET /auth/github/status` and remove it with
 Request a token for one GitHub owner:
 
 ```sh
-GH_TOKEN="$(curl -fsS -X POST https://tsgh.example.ts.net/token/acme)" gh repo view acme/api
+GH_TOKEN="$(curl -fsS -X POST http://tsgh/token/acme)" gh repo view acme/api
+```
+
+For an unattended workload, grant its tagged Tailscale node an installation
+token scope. No GitHub account link or user-token configuration is needed:
+
+```json
+{
+  "grants": [
+    {
+      "src": ["tag:ci"],
+      "dst": ["tag:tsgh"],
+      "ip": ["*"],
+      "app": {
+        "bog.dev/cap/tsgh": [
+          {"target": "acme", "repositories": ["api"]},
+          {"target": "acme", "permissions": {"contents": "read"}}
+        ]
+      }
+    }
+  ]
+}
+```
+
+The workload can then fetch a token using only its Tailscale identity:
+
+```sh
+GH_TOKEN="$(curl -fsS -X POST http://tsgh/token/acme)" gh api repos/acme/api
 ```
 
 Run from source:
