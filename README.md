@@ -8,9 +8,12 @@ short-lived GitHub App tokens whose repositories and permissions come from grant
 Put repositories and permissions in separate objects within the same app
 capability array:
 
-```json
+```jsonc
 {
   "grants": [
+    // Members of group:developers can reach the broker and request a GitHub App
+    // installation token for acme. The token is limited to api and web, with
+    // the matching permission values unioned into its final scope.
     {
       "src": ["group:developers"],
       "dst": ["tag:tsgh"],
@@ -22,6 +25,10 @@ capability array:
         ]
       }
     },
+    // This grant adds githubUser=octocat to Alice's matching acme scope. After
+    // linking octocat at /auth/github, she receives a scoped user token instead
+    // of an installation token. Repository and permission limits come from any
+    // other grants she matches, such as group:developers above.
     {
       "src": ["alice@example.com"],
       "dst": ["tag:tsgh"],
@@ -31,15 +38,29 @@ capability array:
           {"target": "acme", "githubUser": "octocat"}
         ]
       }
+    },
+    // Nodes tagged tag:ci can reach the broker and request an installation
+    // token limited to contents:read on acme/api. With no githubUser value, the
+    // workload uses only its Tailscale identity and needs no GitHub account link
+    // or OAuth user-token configuration.
+    {
+      "src": ["tag:ci"],
+      "dst": ["tag:tsgh"],
+      "ip": ["*"],
+      "app": {
+        "bog.dev/cap/tsgh": [
+          {"target": "acme", "repositories": ["api"]},
+          {"target": "acme", "permissions": {"contents": "read"}}
+        ]
+      }
     }
   ]
 }
 ```
 
-Omit `githubUser` for an installation token. Any authenticated node, tagged or
-untagged, may use either token flow. OAuth credentials are shared by GitHub
-login across the broker instance; scoped user tokens are isolated per Tailscale
-node.
+Any authenticated node, tagged or untagged, may use either token flow. OAuth
+credentials are shared by GitHub login across the broker instance; scoped user
+tokens are isolated per Tailscale node.
 
 All matching repository values are unioned. All matching permissions are
 unioned using `admin > write > read`, and the resulting permission map applies
@@ -96,33 +117,6 @@ Request a token for one GitHub owner:
 
 ```sh
 GH_TOKEN="$(curl -fsS -X POST http://tsgh/token/acme)" gh repo view acme/api
-```
-
-For an unattended workload, grant its tagged Tailscale node an installation
-token scope. No GitHub account link or user-token configuration is needed:
-
-```json
-{
-  "grants": [
-    {
-      "src": ["tag:ci"],
-      "dst": ["tag:tsgh"],
-      "ip": ["*"],
-      "app": {
-        "bog.dev/cap/tsgh": [
-          {"target": "acme", "repositories": ["api"]},
-          {"target": "acme", "permissions": {"contents": "read"}}
-        ]
-      }
-    }
-  ]
-}
-```
-
-The workload can then fetch a token using only its Tailscale identity:
-
-```sh
-GH_TOKEN="$(curl -fsS -X POST http://tsgh/token/acme)" gh api repos/acme/api
 ```
 
 Run from source:
