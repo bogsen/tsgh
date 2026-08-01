@@ -13,7 +13,7 @@ import (
 	"tailscale.com/tailcfg"
 )
 
-const Capability = "bog.dev/cap/tsgh"
+const Capability = "bog.dev/cap/github"
 
 type grantValue struct {
 	Target       string            `json:"target"`

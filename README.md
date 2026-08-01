@@ -19,7 +19,7 @@ capability array:
       "dst": ["tag:tsgh"],
       "ip": ["*"],
       "app": {
-        "bog.dev/cap/tsgh": [
+        "bog.dev/cap/github": [
           {"target": "acme", "repositories": ["api", "web"]},
           {"target": "acme", "permissions": {"contents": "read", "pull_requests": "write"}}
         ]
@@ -34,7 +34,7 @@ capability array:
       "dst": ["tag:tsgh"],
       "ip": ["*"],
       "app": {
-        "bog.dev/cap/tsgh": [
+        "bog.dev/cap/github": [
           {"target": "acme", "githubUser": "octocat"}
         ]
       }
@@ -48,7 +48,7 @@ capability array:
       "dst": ["tag:tsgh"],
       "ip": ["*"],
       "app": {
-        "bog.dev/cap/tsgh": [
+        "bog.dev/cap/github": [
           {"target": "acme", "repositories": ["api"]},
           {"target": "acme", "permissions": {"contents": "read"}}
         ]
