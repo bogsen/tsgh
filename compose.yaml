@@ -1,0 +1,30 @@
+services:
+  tsgh:
+    image: ghcr.io/bogsen/tsgh:latest
+    hostname: tsgh
+    restart: unless-stopped
+    stop_grace_period: 15s
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TSGH_GITHUB_APP_ID: ${TSGH_GITHUB_APP_ID}
+      TSGH_GITHUB_PRIVATE_KEY_FILE: /run/secrets/github_app_private_key
+      TSGH_GITHUB_CLIENT_ID: ${TSGH_GITHUB_CLIENT_ID}
+      TSGH_GITHUB_CLIENT_SECRET_FILE: /run/secrets/github_client_secret
+      TSGH_STORE_KEY_FILE: /run/secrets/store_key
+    secrets:
+      - github_app_private_key
+      - github_client_secret
+      - store_key
+    volumes:
+      - tsgh_state:/var/lib/tsgh
+
+secrets:
+  github_app_private_key:
+    file: ./secrets/github-app.pem
+  github_client_secret:
+    file: ./secrets/github-client-secret.key
+  store_key:
+    file: ./secrets/store.key
+
+volumes:
+  tsgh_state:
