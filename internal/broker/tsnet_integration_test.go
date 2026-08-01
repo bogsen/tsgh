@@ -113,7 +113,7 @@ func TestTSNetHTTPAndHTTPS(t *testing.T) {
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		if response == nil || response.StatusCode != http.StatusOK || string(body) != "installation-token\n" {
+		if response == nil || response.StatusCode != http.StatusOK || string(body) != "installation-token-1\n" {
 			t.Fatalf("%s returned response=%v body=%q context=%v", endpoint, response, body, ctx.Err())
 		}
 	}

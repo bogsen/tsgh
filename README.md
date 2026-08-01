@@ -121,6 +121,30 @@ Tailscale HTTPS and MagicDNS must be enabled because startup requires both the
 HTTP and HTTPS listeners. The container image runs as UID/GID 65532 and expects
 `/var/lib/tsgh` to be writable when it is used as the state volume.
 
+## Audit logs
+
+Security-relevant broker actions are written as `log/slog` text records on
+standard output. Successful token requests include both the Tailscale caller
+and the SHA-256 token hash used by GitHub organization audit logs:
+
+```text
+time=2026-08-01T12:00:00.000Z level=INFO msg=audit action=token.issue outcome=success status=200 node_id=node-id node_name=client.example.ts.net. source_ip=100.64.0.1 tailscale_user_id=100 tailscale_user_login=alice@example.com target=acme token_type=installation scope_key=scope-hash token_hash="base64-sha256"
+```
+
+The broker audits authentication failures, token issuance attempts, OAuth
+authorization starts, links and unlinks, and scoped-user-token recovery and
+revocation. Routine OAuth status reads, unknown routes, and general HTTP access
+are not logged. Tagged nodes include `tailscale_tags` instead of a user profile.
+`node_id` is the durable identity; `node_key` is logged only when Tailscale does
+not supply a stable node ID.
+
+To correlate an auditable GitHub action, search the target organization's audit
+log for `hashed_token:"<token_hash>"`. Git events require an audit-log export;
+see GitHub's [token audit guidance](https://docs.github.com/en/enterprise-cloud@latest/organizations/keeping-your-organization-secure/managing-security-settings-for-your-organization/identifying-audit-log-events-performed-by-an-access-token).
+GitHub does not provide equivalent organization audit visibility for personal
+account targets. Correlation identifies the Tailscale host that received a
+bearer token; it cannot prove that the token was not copied before use.
+
 ## Tests
 
 ```sh

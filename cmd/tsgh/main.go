@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -50,6 +51,7 @@ func run() error {
 		GitHub:      config.GitHub,
 		Store:       config.Store,
 		Logf:        log.Printf,
+		AuditLog:    slog.New(slog.NewTextHandler(os.Stdout, nil)),
 	})
 	if err != nil {
 		return err

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -208,7 +209,7 @@ func (f *fakeGitHub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.issued++
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(IssuedToken{Token: "installation-token", ExpiresAt: f.now().Add(time.Hour)})
+		json.NewEncoder(w).Encode(IssuedToken{Token: fmt.Sprintf("installation-token-%d", f.issued), ExpiresAt: f.now().Add(time.Hour)})
 	case r.URL.Path == "/applications/client/token/scoped":
 		username, password, ok := r.BasicAuth()
 		if !ok || username != "client" || password != "secret" {
@@ -279,18 +280,26 @@ func (f *fakeGitHub) counts() (installs, issued, scoped, revoked int) {
 func TestInstallationTokenHandler(t *testing.T) {
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	fake, github := newFakeGitHub(t, func() time.Time { return now })
-	app := testApp(t, github, nil, func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
-		return testWhoIs("100", "node-1", testCaps(
+	var audit bytes.Buffer
+	app := testAppWithAudit(t, github, nil, func(_ context.Context, remote string) (*apitype.WhoIsResponse, error) {
+		nodeID, nodeName := "node-1", "client-one.example.ts.net."
+		if strings.HasPrefix(remote, "other") {
+			nodeID, nodeName = "node-2", "client-two.example.ts.net."
+		}
+		who := testWhoIs("100", nodeID, testCaps(
 			`{"target":"acme","repositories":["api"]}`,
 			`{"target":"acme","permissions":{"contents":"read"}}`,
-		)), nil
-	}, func() time.Time { return now })
+		))
+		who.Node.Name = nodeName
+		who.UserProfile.LoginName = "alice@example.com"
+		return who, nil
+	}, func() time.Time { return now }, testAuditLog(&audit))
 
 	for _, scheme := range []string{"http", "https"} {
 		req := httptest.NewRequest(http.MethodPost, scheme+"://tsgh/token/acme", nil)
 		response := httptest.NewRecorder()
 		app.ServeHTTP(response, req)
-		if response.Code != http.StatusOK || response.Body.String() != "installation-token\n" {
+		if response.Code != http.StatusOK || response.Body.String() != "installation-token-1\n" {
 			t.Fatalf("response = %d %q", response.Code, response.Body.String())
 		}
 		if response.Header().Get("Cache-Control") != "no-store" || !strings.HasPrefix(response.Header().Get("Content-Type"), "text/plain") {
@@ -311,6 +320,68 @@ func TestInstallationTokenHandler(t *testing.T) {
 	if after, _, _, _ := fake.counts(); after != installs {
 		t.Fatal("denied request reached GitHub")
 	}
+
+	for range 2 {
+		req := httptest.NewRequest(http.MethodPost, "http://tsgh/token/acme", nil)
+		req.RemoteAddr = "other:1234"
+		response := httptest.NewRecorder()
+		app.ServeHTTP(response, req)
+		if response.Code != http.StatusOK || response.Body.String() != "installation-token-2\n" {
+			t.Fatalf("other-node response = %d %q", response.Code, response.Body.String())
+		}
+	}
+	installs, issued, _, _ = fake.counts()
+	if installs != 1 || issued != 2 {
+		t.Fatalf("node cache isolation failed: installations=%d issued=%d", installs, issued)
+	}
+
+	logText := audit.String()
+	firstSum := sha256.Sum256([]byte("installation-token-1"))
+	secondSum := sha256.Sum256([]byte("installation-token-2"))
+	firstHash := base64.StdEncoding.EncodeToString(firstSum[:])
+	secondHash := base64.StdEncoding.EncodeToString(secondSum[:])
+	for _, field := range []string{
+		"action=token.issue", "outcome=success", "outcome=denied", "reason=token_not_granted",
+		"node_id=node-1", "node_name=client-one.example.ts.net.", "source_ip=192.0.2.1",
+		"tailscale_user_id=100", "tailscale_user_login=alice@example.com", "target=acme",
+		"token_type=installation", `token_hash="` + firstHash + `"`, "node_id=node-2", `token_hash="` + secondHash + `"`,
+	} {
+		if !strings.Contains(logText, field) {
+			t.Errorf("audit log omitted %q:\n%s", field, logText)
+		}
+	}
+	if strings.Count(logText, "action=token.issue") != 5 || strings.Count(logText, `token_hash="`+firstHash+`"`) != 2 || strings.Count(logText, `token_hash="`+secondHash+`"`) != 2 {
+		t.Fatalf("unexpected audit event counts:\n%s", logText)
+	}
+	if strings.Contains(logText, "installation-token-") {
+		t.Fatalf("audit log exposed an installation token:\n%s", logText)
+	}
+}
+
+func TestInstallationTokenCachePrunesExpiredNodes(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	identity := caller{NodeID: "active-node"}
+	scope := Scope{Target: "Acme", Repositories: []string{"api"}, Permissions: map[string]string{"contents": "read"}}
+	activeKey := identity.NodeID + ":" + strings.ToLower(scope.Target) + ":" + scope.Key()
+	app := &App{
+		now: func() time.Time { return now },
+		installationTokens: map[string]cachedInstallationToken{
+			"expired-node": {Token: "expired", ExpiresAt: now.Add(-time.Minute)},
+			"near-expiry":  {Token: "near", ExpiresAt: now.Add(time.Minute)},
+			activeKey:      {Token: "active", ExpiresAt: now.Add(2 * time.Minute)},
+		},
+	}
+
+	token, err := app.issueInstallationTokenLocked(context.Background(), identity, scope)
+	if err != nil || token != "active" {
+		t.Fatalf("cached token = %q, %v", token, err)
+	}
+	if len(app.installationTokens) != 1 {
+		t.Fatalf("cache retained stale nodes: %#v", app.installationTokens)
+	}
+	if _, ok := app.installationTokens[activeKey]; !ok {
+		t.Fatal("cache pruned the reusable token")
+	}
 }
 
 func TestMissingInstallationResponse(t *testing.T) {
@@ -330,10 +401,138 @@ func TestMissingInstallationResponse(t *testing.T) {
 	}
 }
 
+func TestAuthenticationAndFallbackIdentityAudit(t *testing.T) {
+	t.Run("authentication failure", func(t *testing.T) {
+		var audit bytes.Buffer
+		app, err := NewApp(AppConfig{
+			WhoIs:    func(context.Context, string) (*apitype.WhoIsResponse, error) { return nil, errors.New("not found") },
+			GitHub:   &GitHub{},
+			AuditLog: testAuditLog(&audit),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodGet, "http://tsgh/auth/github/callback?code=oauth-secret&state=state-secret", nil)
+		request.RemoteAddr = "[fd7a:115c:a1e0::1]:1234"
+		response := httptest.NewRecorder()
+		app.ServeHTTP(response, request)
+		logText := audit.String()
+		if response.Code != http.StatusUnauthorized || !strings.Contains(logText, "action=authentication") || !strings.Contains(logText, "outcome=denied") || !strings.Contains(logText, "status=401") || !strings.Contains(logText, "source_ip=fd7a:115c:a1e0::1") || !strings.Contains(logText, "reason=tailscale_identity_required") {
+			t.Fatalf("unexpected authentication response or audit: status=%d\n%s", response.Code, logText)
+		}
+		for _, secret := range []string{"oauth-secret", "state-secret", "code=", "state="} {
+			if strings.Contains(logText, secret) {
+				t.Fatalf("authentication audit exposed %q:\n%s", secret, logText)
+			}
+		}
+	})
+
+	t.Run("node key fallback", func(t *testing.T) {
+		var audit bytes.Buffer
+		nodeKey := key.NewNode().Public()
+		app, err := NewApp(AppConfig{
+			WhoIs: func(context.Context, string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{Node: &tailcfg.Node{Key: nodeKey}}, nil
+			},
+			GitHub:   &GitHub{},
+			AuditLog: testAuditLog(&audit),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		app.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "http://tsgh/token/acme", nil))
+		logText := audit.String()
+		if response.Code != http.StatusForbidden || !strings.Contains(logText, "node_key="+nodeKey.String()) || strings.Contains(logText, "node_id=") {
+			t.Fatalf("node-key fallback was not audited correctly: status=%d\n%s", response.Code, logText)
+		}
+	})
+}
+
+func TestTokenAuditError(t *testing.T) {
+	var audit bytes.Buffer
+	app, err := NewApp(AppConfig{
+		WhoIs: func(context.Context, string) (*apitype.WhoIsResponse, error) {
+			return testWhoIs("100", "node-1", testCaps(
+				`{"target":"acme","githubUser":"octocat"}`,
+				`{"target":"acme","repositories":["api"]}`,
+				`{"target":"acme","permissions":{"contents":"read"}}`,
+			)), nil
+		},
+		GitHub:   &GitHub{ClientID: "client", ClientSecret: "oauth-secret"},
+		AuditLog: testAuditLog(&audit),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	app.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "http://tsgh/token/acme", nil))
+	logText := audit.String()
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(logText, "action=token.issue") || !strings.Contains(logText, "outcome=error") || !strings.Contains(logText, "status=503") || !strings.Contains(logText, "reason=user_tokens_unconfigured") {
+		t.Fatalf("unexpected token error response or audit: status=%d\n%s", response.Code, logText)
+	}
+	if strings.Contains(logText, "oauth-secret") || strings.Contains(logText, "token_hash=") {
+		t.Fatalf("failed token audit exposed a secret or hash:\n%s", logText)
+	}
+}
+
+func TestOAuthUnlinkAuditAndStatusOmission(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	fake, github := newFakeGitHub(t, func() time.Time { return now })
+	store, err := NewStore(t.TempDir(), bytes.Repeat([]byte{7}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutCredentials("octocat", OAuthCredentials{
+		AccessToken:      "base-token",
+		AccessExpiresAt:  now.Add(time.Hour),
+		RefreshToken:     "refresh-token",
+		RefreshExpiresAt: now.Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var audit bytes.Buffer
+	app := testAppWithAudit(t, github, store, func(context.Context, string) (*apitype.WhoIsResponse, error) {
+		who := testWhoIs("100", "node-1", testCaps(`{"target":"acme","githubUser":"octocat"}`))
+		who.Node.Name = "client.example.ts.net."
+		who.UserProfile.LoginName = "alice@example.com"
+		return who, nil
+	}, func() time.Time { return now }, testAuditLog(&audit))
+
+	status := httptest.NewRecorder()
+	app.ServeHTTP(status, httptest.NewRequest(http.MethodGet, "http://tsgh/auth/github/status", nil))
+	if status.Code != http.StatusOK || audit.Len() != 0 {
+		t.Fatalf("status request was audited: status=%d\n%s", status.Code, audit.String())
+	}
+	notFound := httptest.NewRecorder()
+	app.ServeHTTP(notFound, httptest.NewRequest(http.MethodGet, "http://tsgh/unknown", nil))
+	if notFound.Code != http.StatusNotFound || audit.Len() != 0 {
+		t.Fatalf("unknown route was audited: status=%d\n%s", notFound.Code, audit.String())
+	}
+
+	response := httptest.NewRecorder()
+	app.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "http://tsgh/auth/github", nil))
+	logText := audit.String()
+	if response.Code != http.StatusNoContent || strings.Count(logText, "action=oauth.unlink") != 1 || !strings.Contains(logText, "outcome=success") || !strings.Contains(logText, "status=204") || !strings.Contains(logText, "github_actor=octocat") {
+		t.Fatalf("unexpected unlink response or audit: status=%d\n%s", response.Code, logText)
+	}
+	if strings.Contains(logText, "base-token") || strings.Contains(logText, "refresh-token") {
+		t.Fatalf("unlink audit exposed credentials:\n%s", logText)
+	}
+	fake.mu.Lock()
+	grantsGone := fake.grantsGone
+	fake.mu.Unlock()
+	if grantsGone != 1 {
+		t.Fatalf("github grants revoked = %d", grantsGone)
+	}
+}
+
 func TestTaggedNodeOAuthTokenAndRevocation(t *testing.T) {
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	nowFunc := func() time.Time { return now }
 	fake, github := newFakeGitHub(t, nowFunc)
+	var audit bytes.Buffer
+	auditLog := testAuditLog(&audit)
 	dir := t.TempDir()
 	keyBytes := bytes.Repeat([]byte{9}, 32)
 	store, err := NewStore(dir, keyBytes)
@@ -350,11 +549,12 @@ func TestTaggedNodeOAuthTokenAndRevocation(t *testing.T) {
 			`{"target":"acme","repositories":["api"]}`,
 			`{"target":"acme","permissions":{"contents":"read"}}`,
 		))
+		who.Node.Name = nodeID + ".example.ts.net."
 		who.Node.Tags = []string{"tag:ci"}
 		who.UserProfile = nil
 		return who, nil
 	}
-	app := testApp(t, github, store, who, nowFunc)
+	app := testAppWithAudit(t, github, store, who, nowFunc, auditLog)
 	notLinked := httptest.NewRecorder()
 	app.ServeHTTP(notLinked, httptest.NewRequest(http.MethodPost, "http://tsgh/token/acme", nil))
 	if notLinked.Code != http.StatusForbidden || notLinked.Body.String() != "github account \"octocat\" is not linked; visit http://tsgh/auth/github\n" {
@@ -374,6 +574,7 @@ func TestTaggedNodeOAuthTokenAndRevocation(t *testing.T) {
 	if state == "" || location.Query().Get("code_challenge") == "" {
 		t.Fatal("oauth redirect omitted state or PKCE challenge")
 	}
+	verifier := app.pending[state].Verifier
 	fake.mu.Lock()
 	fake.challenge = location.Query().Get("code_challenge")
 	fake.mu.Unlock()
@@ -389,10 +590,12 @@ func TestTaggedNodeOAuthTokenAndRevocation(t *testing.T) {
 	start = httptest.NewRecorder()
 	app.ServeHTTP(start, httptest.NewRequest(http.MethodGet, "http://tsgh/auth/github", nil))
 	location, _ = url.Parse(start.Header().Get("Location"))
+	secondState := location.Query().Get("state")
+	secondVerifier := app.pending[secondState].Verifier
 	fake.mu.Lock()
 	fake.challenge = location.Query().Get("code_challenge")
 	fake.mu.Unlock()
-	callback := httptest.NewRequest(http.MethodGet, "http://tsgh/auth/github/callback?code=code&state="+url.QueryEscape(location.Query().Get("state")), nil)
+	callback := httptest.NewRequest(http.MethodGet, "http://tsgh/auth/github/callback?code=code&state="+url.QueryEscape(secondState), nil)
 	linked := httptest.NewRecorder()
 	app.ServeHTTP(linked, callback)
 	if linked.Code != http.StatusOK || linked.Body.String() != "linked octocat\n" {
@@ -427,7 +630,7 @@ func TestTaggedNodeOAuthTokenAndRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restarted := testApp(t, github, reloaded, who, nowFunc)
+	restarted := testAppWithAudit(t, github, reloaded, who, nowFunc, auditLog)
 	fake.mu.Lock()
 	fake.revokeFail = 1
 	fake.mu.Unlock()
@@ -440,6 +643,33 @@ func TestTaggedNodeOAuthTokenAndRevocation(t *testing.T) {
 	_, _, _, revoked = fake.counts()
 	if revoked != 3 || len(reloaded.ScopedTokens()) != 0 {
 		t.Fatalf("strict revocation failed after restart: attempts=%d records=%d", revoked, len(reloaded.ScopedTokens()))
+	}
+
+	logText := audit.String()
+	firstSum := sha256.Sum256([]byte("user-token-1"))
+	secondSum := sha256.Sum256([]byte("user-token-2"))
+	firstHash := base64.StdEncoding.EncodeToString(firstSum[:])
+	secondHash := base64.StdEncoding.EncodeToString(secondSum[:])
+	for _, field := range []string{
+		"action=oauth.authorize_start", "action=oauth.link", "reason=invalid_oauth_callback",
+		"reason=github_account_not_linked", "github_actor=octocat", "tailscale_tags=tag:ci",
+		"action=token.recover", "action=token.revoke", "reason=github_token_revocation_failed",
+		`token_hash="` + firstHash + `"`, `token_hash="` + secondHash + `"`,
+	} {
+		if !strings.Contains(logText, field) {
+			t.Errorf("audit log omitted %q:\n%s", field, logText)
+		}
+	}
+	if strings.Count(logText, "action=oauth.authorize_start") != 2 || strings.Count(logText, "action=oauth.link") != 2 || strings.Count(logText, "action=token.recover") != 2 || strings.Count(logText, "action=token.revoke") != 3 {
+		t.Fatalf("unexpected OAuth or token lifecycle audit counts:\n%s", logText)
+	}
+	for _, secret := range []string{"base-token", "refresh-token", "user-token-", state, secondState, verifier, secondVerifier, "code=code"} {
+		if strings.Contains(logText, secret) {
+			t.Fatalf("audit log exposed %q:\n%s", secret, logText)
+		}
+	}
+	if strings.Contains(logText, "tailscale_user_login=") {
+		t.Fatalf("tagged-node audit unexpectedly included a user login:\n%s", logText)
 	}
 }
 
@@ -603,6 +833,10 @@ func TestRevokerStopsWithoutShutdownSweep(t *testing.T) {
 }
 
 func testApp(t *testing.T, github *GitHub, store *Store, who WhoIsFunc, now func() time.Time) *App {
+	return testAppWithAudit(t, github, store, who, now, nil)
+}
+
+func testAppWithAudit(t *testing.T, github *GitHub, store *Store, who WhoIsFunc, now func() time.Time, auditLog *slog.Logger) *App {
 	t.Helper()
 	app, err := NewApp(AppConfig{
 		RedirectURI: "http://tsgh/auth/github/callback",
@@ -610,11 +844,23 @@ func testApp(t *testing.T, github *GitHub, store *Store, who WhoIsFunc, now func
 		GitHub:      github,
 		Store:       store,
 		Now:         now,
+		AuditLog:    auditLog,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return app
+}
+
+func testAuditLog(output io.Writer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{
+		ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
+			if attr.Key == slog.TimeKey {
+				return slog.Attr{}
+			}
+			return attr
+		},
+	}))
 }
 
 func testCaps(values ...string) tailcfg.PeerCapMap {
